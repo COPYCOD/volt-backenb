@@ -1,0 +1,118 @@
+const { Server } = require('socket.io');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { addMessage, getConversationMembers, findUserById } = require('./db');
+const { sendPushToUser } = require('./push');
+
+// userId -> Set of live socket ids (a user can have several tabs/devices open)
+const onlineUsers = new Map();
+
+function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
+  const io = new Server(httpServer, {
+    cors: { origin: corsOrigin === '*' ? '*' : corsOrigin.split(',') },
+  });
+
+  // Every socket must present the same JWT the REST API uses.
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error('missing_token'));
+    try {
+      const payload = jwt.verify(token, jwtSecret);
+      socket.userId = payload.sub;
+      next();
+    } catch {
+      next(new Error('invalid_token'));
+    }
+  });
+
+  io.on('connection', (socket) => {
+    const userId = socket.userId;
+    if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
+    onlineUsers.get(userId).add(socket.id);
+    broadcastPresence(io, userId, true);
+
+    // ---- chat messages ----
+    socket.on('message:send', ({ conversationId, text }, ack) => {
+      if (!conversationId || !text || !text.trim()) return ack?.({ error: 'invalid_message' });
+      const members = getConversationMembers(conversationId);
+      const isMember = members.some(m => m.id === userId);
+      if (!isMember) return ack?.({ error: 'not_a_member' });
+
+      const message = addMessage({
+        id: crypto.randomUUID(),
+        conversationId,
+        senderId: userId,
+        text: text.trim().slice(0, 4000),
+      });
+
+      // deliver to every online socket of every member (including sender's other tabs)
+      members.forEach(member => {
+        const sockets = onlineUsers.get(member.id);
+        if (sockets && sockets.size > 0) {
+          sockets.forEach(sid => io.to(sid).emit('message:new', { conversationId, message }));
+        } else if (member.id !== userId) {
+          // offline — try a push notification instead of an in-app event
+          const sender = findUserById(userId);
+          sendPushToUser(member.id, {
+            title: sender?.name || 'VOLT',
+            body: message.text,
+            conversationId,
+          }).catch(err => console.error('push send failed:', err.message));
+        }
+      });
+      ack?.({ ok: true, message });
+    });
+
+    socket.on('typing', ({ conversationId }) => {
+      const members = getConversationMembers(conversationId);
+      members.filter(m => m.id !== userId).forEach(member => {
+        const sockets = onlineUsers.get(member.id);
+        if (sockets) sockets.forEach(sid => io.to(sid).emit('typing', { conversationId, userId }));
+      });
+    });
+
+    // ---- WebRTC call signaling (server just relays SDP/ICE between two users) ----
+    socket.on('call:invite', ({ toUserId, conversationId, offer }) => {
+      relay(io, toUserId, 'call:invite', { fromUserId: userId, conversationId, offer });
+    });
+    socket.on('call:answer', ({ toUserId, answer }) => {
+      relay(io, toUserId, 'call:answer', { fromUserId: userId, answer });
+    });
+    socket.on('call:ice-candidate', ({ toUserId, candidate }) => {
+      relay(io, toUserId, 'call:ice-candidate', { fromUserId: userId, candidate });
+    });
+    socket.on('call:end', ({ toUserId }) => {
+      relay(io, toUserId, 'call:end', { fromUserId: userId });
+    });
+    socket.on('call:decline', ({ toUserId }) => {
+      relay(io, toUserId, 'call:decline', { fromUserId: userId });
+    });
+
+    socket.on('disconnect', () => {
+      const sockets = onlineUsers.get(userId);
+      if (sockets) {
+        sockets.delete(socket.id);
+        if (sockets.size === 0) {
+          onlineUsers.delete(userId);
+          broadcastPresence(io, userId, false);
+        }
+      }
+    });
+  });
+
+  return io;
+}
+
+function relay(io, toUserId, event, payload) {
+  const sockets = onlineUsers.get(toUserId);
+  if (!sockets || sockets.size === 0) return; // recipient offline — no push notifications wired up yet
+  sockets.forEach(sid => io.to(sid).emit(event, payload));
+}
+
+function broadcastPresence(io, userId, isOnline) {
+  // Naive broadcast to everyone; fine for small deployments. For scale,
+  // only notify users who share a conversation with `userId`.
+  io.emit('presence', { userId, isOnline, ts: Date.now() });
+}
+
+module.exports = { attachRealtime, onlineUsers };
