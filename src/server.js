@@ -77,14 +77,19 @@ app.post('/api/auth/send-code', sendCodeLimiter, async (req, res) => {
   }
 
   if (!SMS_ENABLED) {
-    let user = findUserByPhone(phone);
-    let isNewUser = false;
-    if (!user) {
-      user = createUser({ id: crypto.randomUUID(), phone });
-      isNewUser = true;
+    try {
+      let user = findUserByPhone(phone);
+      let isNewUser = false;
+      if (!user) {
+        user = createUser({ id: crypto.randomUUID(), phone });
+        isNewUser = true;
+      }
+      const token = issueToken(user.id);
+      return res.json({ devMode: true, status: 'approved', token, isNewUser, user: toPublicUser(user) });
+    } catch (err) {
+      console.error('NO-SMS MODE login error:', err);
+      return res.status(500).json({ error: 'server_error', message: err.message });
     }
-    const token = issueToken(user.id);
-    return res.json({ devMode: true, status: 'approved', token, isNewUser, user: toPublicUser(user) });
   }
 
   try {
@@ -235,8 +240,23 @@ function toPublicUser(u) {
   };
 }
 
+// Express-level error handler — catches anything thrown/rejected in a
+// route that wasn't already handled, and returns JSON instead of letting
+// Express fall through to a crash. Must be registered after all routes.
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled route error:', err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'server_error', message: 'Внутрішня помилка сервера. Спробуйте ще раз.' });
+});
+
 const httpServer = http.createServer(app);
 attachRealtime(httpServer, { corsOrigin: CORS_ORIGIN, jwtSecret: JWT_SECRET });
+
+// Last-resort safety net — logs the real cause instead of the whole
+// process silently dying (which is what turns into a mysterious "Failed
+// to fetch" on every subsequent request from the app).
+process.on('unhandledRejection', (err) => console.error('Unhandled promise rejection:', err));
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
 
 httpServer.listen(PORT, () => {
   console.log(`⚡ VOLT backend (REST + realtime) running on http://localhost:${PORT}`);
