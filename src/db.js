@@ -32,7 +32,12 @@ let data = loadData();
 function save() {
   // Synchronous write is fine at MVP traffic levels — simplicity over
   // throughput. Swap for a real DB before this becomes a bottleneck.
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error(`Failed to write ${DB_FILE}:`, err.message);
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------
