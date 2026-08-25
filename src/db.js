@@ -3,7 +3,7 @@
 //
 // Why not a real database? better-sqlite3 (and most fast embedded DBs)
 // need to compile native C++ code when you `npm install`, which fails on
-// several free hosts depending on their exact Node/build-tool version —
+// several free hosts depending on their exact Node/build-tool version --
 // that's the "gyp ERR!" build failure you may have hit. A JSON file needs
 // zero compilation, so `npm install` always just works. It's plenty for
 // an MVP with a handful of users; swap this file for a real Postgres/Mongo
@@ -16,14 +16,17 @@ const crypto = require('crypto');
 
 const DB_FILE = path.join(__dirname, '..', 'volt-data.json');
 
+function emptyData() {
+  return { users: [], conversations: [], conversationMembers: [], messages: [], pushTokens: [], sessions: [] };
+}
+
 function loadData() {
-  if (!fs.existsSync(DB_FILE)) {
-    return { users: [], conversations: [], conversationMembers: [], messages: [], pushTokens: [] };
-  }
+  if (!fs.existsSync(DB_FILE)) return emptyData();
   try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    return { ...emptyData(), ...parsed }; // fills in any new arrays added since the file was last written
   } catch {
-    return { users: [], conversations: [], conversationMembers: [], messages: [], pushTokens: [] };
+    return emptyData();
   }
 }
 
@@ -60,19 +63,21 @@ function createUser({ id, phone, name, username, avatar_emoji, bio }) {
     username: username || null,
     bio: bio || null,
     avatar_emoji: avatar_emoji || '🙂',
+    avatar_photo: null,
     created_at: Date.now(),
   };
   data.users.push(user);
   save();
   return user;
 }
-function updateUserProfile(id, { name, username, avatar_emoji, bio }) {
+function updateUserProfile(id, { name, username, avatar_emoji, bio, avatar_photo }) {
   const user = findUserById(id);
   if (!user) return null;
   user.name = name;
   user.username = username;
   user.avatar_emoji = avatar_emoji;
   user.bio = bio ?? null;
+  if (avatar_photo !== undefined) user.avatar_photo = avatar_photo; // base64 data URL, or null to clear
   save();
   return user;
 }
@@ -127,12 +132,14 @@ function listConversationsForUser(userId) {
   return result.sort((a, b) => (b.lastMessage?.created_at || b.created_at) - (a.lastMessage?.created_at || a.created_at));
 }
 
-function addMessage({ id, conversationId, senderId, text }) {
+function addMessage({ id, conversationId, senderId, text, mediaType, mediaData }) {
   const message = {
     id,
     conversation_id: conversationId,
     sender_id: senderId,
-    text,
+    text: text || '',
+    media_type: mediaType || null,   // null | 'image' | 'voice'
+    media_data: mediaData || null,   // base64 data URL
     created_at: Date.now(),
   };
   data.messages.push(message);
@@ -165,6 +172,36 @@ function removePushToken(token) {
   save();
 }
 
+// ---------------------------------------------------------------------
+// Sessions (real logged-in devices, shown in Settings -> Devices)
+// ---------------------------------------------------------------------
+function createSession({ userId, userAgent, ip }) {
+  const session = {
+    id: crypto.randomUUID(),
+    user_id: userId,
+    user_agent: userAgent || 'Unknown device',
+    ip: ip || null,
+    created_at: Date.now(),
+    last_seen_at: Date.now(),
+  };
+  data.sessions.push(session);
+  save();
+  return session;
+}
+function touchSession(sessionId) {
+  const s = data.sessions.find(s => s.id === sessionId);
+  if (s) { s.last_seen_at = Date.now(); save(); }
+}
+function listSessionsForUser(userId) {
+  return data.sessions
+    .filter(s => s.user_id === userId)
+    .sort((a, b) => b.last_seen_at - a.last_seen_at);
+}
+function deleteSession(sessionId) {
+  data.sessions = data.sessions.filter(s => s.id !== sessionId);
+  save();
+}
+
 module.exports = {
   findUserByPhone, findUserById, createUser, updateUserProfile,
   findUserByUsername,
@@ -176,4 +213,8 @@ module.exports = {
   savePushToken,
   getPushTokensForUser,
   removePushToken,
+  createSession,
+  touchSession,
+  listSessionsForUser,
+  deleteSession,
 };

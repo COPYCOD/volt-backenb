@@ -9,10 +9,10 @@ if (!SECRET || SECRET === 'change_this_to_a_long_random_string') {
   );
 }
 
-function issueToken(userId) {
+function issueToken(userId, sessionId) {
   // 30-day session. Shorten this (and add refresh tokens) for a
   // production app that needs tighter session control.
-  return jwt.sign({ sub: userId }, SECRET, { expiresIn: '30d' });
+  return jwt.sign({ sub: userId, sid: sessionId }, SECRET, { expiresIn: '30d' });
 }
 
 function requireAuth(req, res, next) {
@@ -22,6 +22,7 @@ function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, SECRET);
     req.userId = payload.sub;
+    req.sessionId = payload.sid;
     next();
   } catch (e) {
     return res.status(401).json({ error: 'invalid_or_expired_token' });

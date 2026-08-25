@@ -1,7 +1,8 @@
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { addMessage, getConversationMembers, findUserById } = require('./db');
+const { addMessage, getConversationMembers, findUserById, touchSession } = require('./db');
+const { toPublicMessage } = require('./serialize');
 const { sendPushToUser } = require('./push');
 
 // userId -> Set of live socket ids (a user can have several tabs/devices open)
@@ -10,6 +11,7 @@ const onlineUsers = new Map();
 function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
   const io = new Server(httpServer, {
     cors: { origin: corsOrigin === '*' ? '*' : corsOrigin.split(',') },
+    maxHttpBufferSize: 15 * 1024 * 1024, // voice notes / photos travel as base64 over the socket too
   });
 
   // Every socket must present the same JWT the REST API uses.
@@ -19,6 +21,7 @@ function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
     try {
       const payload = jwt.verify(token, jwtSecret);
       socket.userId = payload.sub;
+      socket.sessionId = payload.sid;
       next();
     } catch {
       next(new Error('invalid_token'));
@@ -27,23 +30,28 @@ function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
 
   io.on('connection', (socket) => {
     const userId = socket.userId;
+    if (socket.sessionId) touchSession(socket.sessionId);
     if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
     onlineUsers.get(userId).add(socket.id);
     broadcastPresence(io, userId, true);
 
-    // ---- chat messages ----
-    socket.on('message:send', ({ conversationId, text }, ack) => {
-      if (!conversationId || !text || !text.trim()) return ack?.({ error: 'invalid_message' });
+    // ---- chat messages (text, and optionally a photo or voice note) ----
+    socket.on('message:send', ({ conversationId, text, mediaType, mediaData }, ack) => {
+      const hasMedia = mediaType && mediaData;
+      if (!conversationId || (!hasMedia && !text?.trim())) return ack?.({ error: 'invalid_message' });
       const members = getConversationMembers(conversationId);
       const isMember = members.some(m => m.id === userId);
       if (!isMember) return ack?.({ error: 'not_a_member' });
 
-      const message = addMessage({
+      const messageRow = addMessage({
         id: crypto.randomUUID(),
         conversationId,
         senderId: userId,
-        text: text.trim().slice(0, 4000),
+        text: (text || '').trim().slice(0, 4000),
+        mediaType: hasMedia ? mediaType : null,
+        mediaData: hasMedia ? mediaData : null,
       });
+      const message = toPublicMessage(messageRow);
 
       // deliver to every online socket of every member (including sender's other tabs)
       members.forEach(member => {
@@ -53,9 +61,12 @@ function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
         } else if (member.id !== userId) {
           // offline — try a push notification instead of an in-app event
           const sender = findUserById(userId);
+          const preview = message.mediaType === 'voice' ? '🎤 Голосове повідомлення'
+            : message.mediaType === 'image' ? '📷 Фото'
+            : message.text;
           sendPushToUser(member.id, {
             title: sender?.name || 'VOLT',
-            body: message.text,
+            body: preview,
             conversationId,
           }).catch(err => console.error('push send failed:', err.message));
         }
@@ -110,8 +121,6 @@ function relay(io, toUserId, event, payload) {
 }
 
 function broadcastPresence(io, userId, isOnline) {
-  // Naive broadcast to everyone; fine for small deployments. For scale,
-  // only notify users who share a conversation with `userId`.
   io.emit('presence', { userId, isOnline, ts: Date.now() });
 }
 

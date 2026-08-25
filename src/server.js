@@ -10,7 +10,9 @@ const {
   findUserByPhone, findUserById, createUser, updateUserProfile,
   findUserByUsername, getOrCreateDirectConversation, listConversationsForUser,
   listMessages, savePushToken,
+  createSession, touchSession, listSessionsForUser, deleteSession,
 } = require('./db');
+const { toPublicUser, toPublicMessage } = require('./serialize');
 const { attachRealtime } = require('./realtime');
 const { initFirebase } = require('./push');
 initFirebase();
@@ -38,14 +40,19 @@ if (!SMS_ENABLED) {
 
 const app = express();
 
-app.use(cors({ origin: CORS_ORIGIN === '*' ? '*' : CORS_ORIGIN.split(',') }));
-app.use(express.json());
-
-// --- basic request logging, useful while wiring things up ---
+// Log every single incoming request BEFORE anything else touches it —
+// including CORS preflight (OPTIONS) requests, which the cors middleware
+// below would otherwise swallow silently.
 app.use((req, _res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path} | Origin: ${req.headers.origin || '(none)'}`);
   next();
 });
+
+app.use(cors({ origin: CORS_ORIGIN === '*' ? '*' : CORS_ORIGIN.split(',') }));
+// Media (photos/voice notes) travel as base64 inside JSON — bump the body
+// limit well past Express's 100kb default so those requests don't get
+// rejected outright.
+app.use(express.json({ limit: '15mb' }));
 
 // SMS costs real money per message, so this endpoint is rate-limited hard:
 // max 3 code requests per phone-ish window per IP every 10 minutes.
@@ -58,17 +65,41 @@ const sendCodeLimiter = rateLimit({
 });
 
 function isValidE164(phone) {
-  // e.g. +972501234567 — a plus sign followed by 8 to 15 digits.
   return /^\+[1-9]\d{7,14}$/.test(phone);
+}
+
+// Turns a raw User-Agent string into something a person can recognize,
+// e.g. "Chrome on Android" instead of the full UA blob.
+function describeDevice(userAgent = '') {
+  const ua = userAgent.toLowerCase();
+  let os = 'Unknown OS';
+  if (ua.includes('android')) os = 'Android';
+  else if (ua.includes('iphone') || ua.includes('ipad')) os = 'iOS';
+  else if (ua.includes('windows')) os = 'Windows';
+  else if (ua.includes('mac os')) os = 'macOS';
+  else if (ua.includes('linux')) os = 'Linux';
+
+  let browser = 'Browser';
+  if (ua.includes('edg/')) browser = 'Edge';
+  else if (ua.includes('chrome/')) browser = 'Chrome';
+  else if (ua.includes('firefox/')) browser = 'Firefox';
+  else if (ua.includes('safari/') && !ua.includes('chrome')) browser = 'Safari';
+
+  return `${browser} on ${os}`;
+}
+
+function loginSuccess(res, user, isNewUser, req) {
+  const session = createSession({
+    userId: user.id,
+    userAgent: describeDevice(req.headers['user-agent']),
+    ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+  });
+  const token = issueToken(user.id, session.id);
+  res.json({ devMode: !SMS_ENABLED, status: 'approved', token, isNewUser, user: toPublicUser(user) });
 }
 
 // ---------------------------------------------------------------------
 // POST /api/auth/send-code   { phone: "+972501234567" }
-//
-// With Twilio configured: sends a real SMS code, returns { status: 'pending' }.
-// Without Twilio (NO-SMS MODE): logs the person in immediately — no code,
-// no verification step. Returns { devMode: true, token, isNewUser, user }
-// and the frontend skips straight past the code screen.
 // ---------------------------------------------------------------------
 app.post('/api/auth/send-code', sendCodeLimiter, async (req, res) => {
   const { phone } = req.body || {};
@@ -80,12 +111,8 @@ app.post('/api/auth/send-code', sendCodeLimiter, async (req, res) => {
     try {
       let user = findUserByPhone(phone);
       let isNewUser = false;
-      if (!user) {
-        user = createUser({ id: crypto.randomUUID(), phone });
-        isNewUser = true;
-      }
-      const token = issueToken(user.id);
-      return res.json({ devMode: true, status: 'approved', token, isNewUser, user: toPublicUser(user) });
+      if (!user) { user = createUser({ id: crypto.randomUUID(), phone }); isNewUser = true; }
+      return loginSuccess(res, user, isNewUser, req);
     } catch (err) {
       console.error('NO-SMS MODE login error:', err);
       return res.status(500).json({ error: 'server_error', message: err.message });
@@ -96,11 +123,9 @@ app.post('/api/auth/send-code', sendCodeLimiter, async (req, res) => {
     const verification = await twilioClient.verify.v2
       .services(TWILIO_VERIFY_SERVICE_SID)
       .verifications.create({ to: phone, channel: 'sms' });
-
-    res.json({ status: verification.status }); // "pending"
+    res.json({ status: verification.status });
   } catch (err) {
     console.error('Twilio send-code error:', err.message);
-    // Twilio trial accounts can only text pre-verified numbers — surface that clearly.
     if (err.code === 21608) {
       return res.status(400).json({
         error: 'unverified_number',
@@ -113,11 +138,6 @@ app.post('/api/auth/send-code', sendCodeLimiter, async (req, res) => {
 
 // ---------------------------------------------------------------------
 // POST /api/auth/verify-code   { phone, code }
-// Only used when SMS is enabled (NO-SMS MODE never reaches this — the
-// frontend logs in directly from the send-code response above).
-// Checks the code with Twilio; on success, creates/finds the account
-// and returns a session token the frontend stores and sends back on
-// every future request as "Authorization: Bearer <token>".
 // ---------------------------------------------------------------------
 app.post('/api/auth/verify-code', async (req, res) => {
   if (!SMS_ENABLED) return res.status(400).json({ error: 'sms_disabled', message: 'Сервер працює в режимі без SMS — код не потрібен.' });
@@ -136,17 +156,11 @@ app.post('/api/auth/verify-code', async (req, res) => {
 
     let user = findUserByPhone(phone);
     let isNewUser = false;
-    if (!user) {
-      user = createUser({ id: crypto.randomUUID(), phone });
-      isNewUser = true;
-    }
-
-    const token = issueToken(user.id);
-    res.json({ token, isNewUser, user: toPublicUser(user) });
+    if (!user) { user = createUser({ id: crypto.randomUUID(), phone }); isNewUser = true; }
+    loginSuccess(res, user, isNewUser, req);
   } catch (err) {
     console.error('Twilio verify-code error:', err.message);
     if (err.code === 20404) {
-      // No pending verification found (expired / already used / never sent).
       return res.status(410).json({ error: 'code_expired', message: 'Код прострочено. Запросіть новий.' });
     }
     res.status(502).json({ error: 'sms_provider_error', message: err.message });
@@ -154,20 +168,17 @@ app.post('/api/auth/verify-code', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// GET /api/me   — returns the logged-in user's profile
+// Profile
 // ---------------------------------------------------------------------
 app.get('/api/me', requireAuth, (req, res) => {
+  if (req.sessionId) touchSession(req.sessionId);
   const user = findUserById(req.userId);
   if (!user) return res.status(404).json({ error: 'user_not_found' });
   res.json({ user: toPublicUser(user) });
 });
 
-// ---------------------------------------------------------------------
-// PUT /api/me   { name, username, avatar_emoji } — completes profile
-// after first-time verification (name screen in the app).
-// ---------------------------------------------------------------------
 app.put('/api/me', requireAuth, (req, res) => {
-  const { name, username, avatar_emoji, bio } = req.body || {};
+  const { name, username, avatar_emoji, bio, avatar_photo } = req.body || {};
   if (!name || name.trim().length < 2) {
     return res.status(400).json({ error: 'invalid_name' });
   }
@@ -176,15 +187,13 @@ app.put('/api/me', requireAuth, (req, res) => {
     username: (username || '').trim() || null,
     avatar_emoji: avatar_emoji || '🙂',
     bio: (bio || '').trim() || null,
+    avatar_photo: avatar_photo !== undefined ? avatar_photo : undefined,
   });
   res.json({ user: toPublicUser(user) });
 });
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-// POST /api/me/push-token  { token: "<FCM device token>" }
-// The frontend calls this after the browser grants notification
-// permission, so the server knows where to send pushes for this user.
 app.post('/api/me/push-token', requireAuth, (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: 'missing_token' });
@@ -193,15 +202,35 @@ app.post('/api/me/push-token', requireAuth, (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// Conversations & messages — real chat between real accounts.
+// Sessions (real logged-in devices — Settings -> Devices)
 // ---------------------------------------------------------------------
+app.get('/api/sessions', requireAuth, (req, res) => {
+  const sessions = listSessionsForUser(req.userId).map(s => ({
+    id: s.id,
+    device: s.user_agent,
+    ip: s.ip,
+    createdAt: s.created_at,
+    lastSeenAt: s.last_seen_at,
+    current: s.id === req.sessionId,
+  }));
+  res.json({ sessions });
+});
 
-// POST /api/conversations/direct  { phone: "+972501234567" }
-// Starts (or resumes) a 1:1 chat with another VOLT user by their phone
-// number. Both sides must already have accounts.
+app.delete('/api/sessions/:id', requireAuth, (req, res) => {
+  if (req.params.id === req.sessionId) {
+    return res.status(400).json({ error: 'cannot_delete_current_session', message: 'Не можна завершити поточний сеанс звідси — скористайтесь «Вийти».' });
+  }
+  deleteSession(req.params.id);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------
+// Conversations & messages
+// ---------------------------------------------------------------------
 app.post('/api/conversations/direct', requireAuth, (req, res) => {
   const { phone, username } = req.body || {};
-  const other = phone ? findUserByPhone(phone) : (username ? findUserByUsername(username) : null);
+  const cleanUsername = username ? username.replace(/^@/, '').trim() : null;
+  const other = phone ? findUserByPhone(phone) : (cleanUsername ? findUserByUsername(cleanUsername) : null);
   if (!other) return res.status(404).json({ error: 'user_not_found', message: 'Користувача з таким номером/юзернеймом ще немає у VOLT.' });
   if (other.id === req.userId) return res.status(400).json({ error: 'cannot_message_self' });
 
@@ -209,40 +238,21 @@ app.post('/api/conversations/direct', requireAuth, (req, res) => {
   res.json({ conversation: { id: convo.id, otherUser: toPublicUser(other) } });
 });
 
-// GET /api/conversations — all my chats, newest activity first
 app.get('/api/conversations', requireAuth, (req, res) => {
   const convos = listConversationsForUser(req.userId).map(c => ({
     id: c.id,
     otherUser: c.otherUser ? toPublicUser(c.otherUser) : null,
-    lastMessage: c.lastMessage,
+    lastMessage: c.lastMessage ? toPublicMessage(c.lastMessage) : null,
   }));
   res.json({ conversations: convos });
 });
 
-// GET /api/conversations/:id/messages — history for one chat
 app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
-  // (For brevity this MVP doesn't re-check membership here — the socket
-  // layer enforces it for sending; add the same check here before
-  // shipping this to real users.)
-  const messages = listMessages(req.params.id);
+  const messages = listMessages(req.params.id).map(toPublicMessage);
   res.json({ messages });
 });
 
-function toPublicUser(u) {
-  return {
-    id: u.id,
-    phone: u.phone,
-    name: u.name,
-    username: u.username,
-    avatarEmoji: u.avatar_emoji,
-    bio: u.bio,
-    createdAt: u.created_at,
-  };
-}
-
-// Express-level error handler — catches anything thrown/rejected in a
-// route that wasn't already handled, and returns JSON instead of letting
-// Express fall through to a crash. Must be registered after all routes.
+// Express-level error handler
 app.use((err, _req, res, _next) => {
   console.error('Unhandled route error:', err);
   if (res.headersSent) return;
@@ -252,9 +262,6 @@ app.use((err, _req, res, _next) => {
 const httpServer = http.createServer(app);
 attachRealtime(httpServer, { corsOrigin: CORS_ORIGIN, jwtSecret: JWT_SECRET });
 
-// Last-resort safety net — logs the real cause instead of the whole
-// process silently dying (which is what turns into a mysterious "Failed
-// to fetch" on every subsequent request from the app).
 process.on('unhandledRejection', (err) => console.error('Unhandled promise rejection:', err));
 process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
 
