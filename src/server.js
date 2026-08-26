@@ -7,6 +7,7 @@ const rateLimit = require('express-rate-limit');
 
 const { issueToken, requireAuth } = require('./auth');
 const {
+  connect,
   findUserByPhone, findUserById, createUser, updateUserProfile,
   findUserByUsername, getOrCreateDirectConversation, listConversationsForUser,
   listMessages, savePushToken,
@@ -89,13 +90,15 @@ function describeDevice(userAgent = '') {
 }
 
 function loginSuccess(res, user, isNewUser, req) {
-  const session = createSession({
-    userId: user.id,
-    userAgent: describeDevice(req.headers['user-agent']),
-    ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-  });
-  const token = issueToken(user.id, session.id);
-  res.json({ devMode: !SMS_ENABLED, status: 'approved', token, isNewUser, user: toPublicUser(user) });
+  return (async () => {
+    const session = await createSession({
+      userId: user.id,
+      userAgent: describeDevice(req.headers['user-agent']),
+      ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+    });
+    const token = issueToken(user.id, session.id);
+    res.json({ devMode: !SMS_ENABLED, status: 'approved', token, isNewUser, user: toPublicUser(user) });
+  })();
 }
 
 // ---------------------------------------------------------------------
@@ -109,10 +112,10 @@ app.post('/api/auth/send-code', sendCodeLimiter, async (req, res) => {
 
   if (!SMS_ENABLED) {
     try {
-      let user = findUserByPhone(phone);
+      let user = await findUserByPhone(phone);
       let isNewUser = false;
-      if (!user) { user = createUser({ id: crypto.randomUUID(), phone }); isNewUser = true; }
-      return loginSuccess(res, user, isNewUser, req);
+      if (!user) { user = await createUser({ id: crypto.randomUUID(), phone }); isNewUser = true; }
+      return await loginSuccess(res, user, isNewUser, req);
     } catch (err) {
       console.error('NO-SMS MODE login error:', err);
       return res.status(500).json({ error: 'server_error', message: err.message });
@@ -154,10 +157,10 @@ app.post('/api/auth/verify-code', async (req, res) => {
       return res.status(401).json({ error: 'wrong_code', message: 'Невірний код.' });
     }
 
-    let user = findUserByPhone(phone);
+    let user = await findUserByPhone(phone);
     let isNewUser = false;
-    if (!user) { user = createUser({ id: crypto.randomUUID(), phone }); isNewUser = true; }
-    loginSuccess(res, user, isNewUser, req);
+    if (!user) { user = await createUser({ id: crypto.randomUUID(), phone }); isNewUser = true; }
+    await loginSuccess(res, user, isNewUser, req);
   } catch (err) {
     console.error('Twilio verify-code error:', err.message);
     if (err.code === 20404) {
@@ -170,19 +173,19 @@ app.post('/api/auth/verify-code', async (req, res) => {
 // ---------------------------------------------------------------------
 // Profile
 // ---------------------------------------------------------------------
-app.get('/api/me', requireAuth, (req, res) => {
-  if (req.sessionId) touchSession(req.sessionId);
-  const user = findUserById(req.userId);
+app.get('/api/me', requireAuth, async (req, res) => {
+  if (req.sessionId) touchSession(req.sessionId).catch(()=>{});
+  const user = await findUserById(req.userId);
   if (!user) return res.status(404).json({ error: 'user_not_found' });
   res.json({ user: toPublicUser(user) });
 });
 
-app.put('/api/me', requireAuth, (req, res) => {
+app.put('/api/me', requireAuth, async (req, res) => {
   const { name, username, avatar_emoji, bio, avatar_photo } = req.body || {};
   if (!name || name.trim().length < 2) {
     return res.status(400).json({ error: 'invalid_name' });
   }
-  const user = updateUserProfile(req.userId, {
+  const user = await updateUserProfile(req.userId, {
     name: name.trim(),
     username: (username || '').trim() || null,
     avatar_emoji: avatar_emoji || '🙂',
@@ -194,18 +197,19 @@ app.put('/api/me', requireAuth, (req, res) => {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-app.post('/api/me/push-token', requireAuth, (req, res) => {
+app.post('/api/me/push-token', requireAuth, async (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: 'missing_token' });
-  savePushToken(req.userId, token);
+  await savePushToken(req.userId, token);
   res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------------
 // Sessions (real logged-in devices — Settings -> Devices)
 // ---------------------------------------------------------------------
-app.get('/api/sessions', requireAuth, (req, res) => {
-  const sessions = listSessionsForUser(req.userId).map(s => ({
+app.get('/api/sessions', requireAuth, async (req, res) => {
+  const rows = await listSessionsForUser(req.userId);
+  const sessions = rows.map(s => ({
     id: s.id,
     device: s.user_agent,
     ip: s.ip,
@@ -216,30 +220,31 @@ app.get('/api/sessions', requireAuth, (req, res) => {
   res.json({ sessions });
 });
 
-app.delete('/api/sessions/:id', requireAuth, (req, res) => {
+app.delete('/api/sessions/:id', requireAuth, async (req, res) => {
   if (req.params.id === req.sessionId) {
     return res.status(400).json({ error: 'cannot_delete_current_session', message: 'Не можна завершити поточний сеанс звідси — скористайтесь «Вийти».' });
   }
-  deleteSession(req.params.id);
+  await deleteSession(req.params.id);
   res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------------
 // Conversations & messages
 // ---------------------------------------------------------------------
-app.post('/api/conversations/direct', requireAuth, (req, res) => {
+app.post('/api/conversations/direct', requireAuth, async (req, res) => {
   const { phone, username } = req.body || {};
   const cleanUsername = username ? username.replace(/^@/, '').trim() : null;
-  const other = phone ? findUserByPhone(phone) : (cleanUsername ? findUserByUsername(cleanUsername) : null);
+  const other = phone ? await findUserByPhone(phone) : (cleanUsername ? await findUserByUsername(cleanUsername) : null);
   if (!other) return res.status(404).json({ error: 'user_not_found', message: 'Користувача з таким номером/юзернеймом ще немає у VOLT.' });
   if (other.id === req.userId) return res.status(400).json({ error: 'cannot_message_self' });
 
-  const convo = getOrCreateDirectConversation(req.userId, other.id);
+  const convo = await getOrCreateDirectConversation(req.userId, other.id);
   res.json({ conversation: { id: convo.id, otherUser: toPublicUser(other) } });
 });
 
-app.get('/api/conversations', requireAuth, (req, res) => {
-  const convos = listConversationsForUser(req.userId).map(c => ({
+app.get('/api/conversations', requireAuth, async (req, res) => {
+  const rows = await listConversationsForUser(req.userId);
+  const convos = rows.map(c => ({
     id: c.id,
     otherUser: c.otherUser ? toPublicUser(c.otherUser) : null,
     lastMessage: c.lastMessage ? toPublicMessage(c.lastMessage) : null,
@@ -247,9 +252,9 @@ app.get('/api/conversations', requireAuth, (req, res) => {
   res.json({ conversations: convos });
 });
 
-app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
-  const messages = listMessages(req.params.id).map(toPublicMessage);
-  res.json({ messages });
+app.get('/api/conversations/:id/messages', requireAuth, async (req, res) => {
+  const rows = await listMessages(req.params.id);
+  res.json({ messages: rows.map(toPublicMessage) });
 });
 
 // Express-level error handler
@@ -265,6 +270,13 @@ attachRealtime(httpServer, { corsOrigin: CORS_ORIGIN, jwtSecret: JWT_SECRET });
 process.on('unhandledRejection', (err) => console.error('Unhandled promise rejection:', err));
 process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
 
-httpServer.listen(PORT, () => {
-  console.log(`⚡ VOLT backend (REST + realtime) running on http://localhost:${PORT}`);
-});
+connect()
+  .then(() => {
+    httpServer.listen(PORT, () => {
+      console.log(`⚡ VOLT backend (REST + realtime) running on http://localhost:${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('❌ Failed to connect to MongoDB — server not started:', err.message);
+    process.exit(1);
+  });

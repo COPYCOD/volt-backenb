@@ -30,52 +30,57 @@ function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
 
   io.on('connection', (socket) => {
     const userId = socket.userId;
-    if (socket.sessionId) touchSession(socket.sessionId);
+    if (socket.sessionId) touchSession(socket.sessionId).catch(()=>{});
     if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
     onlineUsers.get(userId).add(socket.id);
     broadcastPresence(io, userId, true);
 
     // ---- chat messages (text, and optionally a photo or voice note) ----
-    socket.on('message:send', ({ conversationId, text, mediaType, mediaData }, ack) => {
-      const hasMedia = mediaType && mediaData;
-      if (!conversationId || (!hasMedia && !text?.trim())) return ack?.({ error: 'invalid_message' });
-      const members = getConversationMembers(conversationId);
-      const isMember = members.some(m => m.id === userId);
-      if (!isMember) return ack?.({ error: 'not_a_member' });
+    socket.on('message:send', async ({ conversationId, text, mediaType, mediaData }, ack) => {
+      try {
+        const hasMedia = mediaType && mediaData;
+        if (!conversationId || (!hasMedia && !text?.trim())) return ack?.({ error: 'invalid_message' });
+        const members = await getConversationMembers(conversationId);
+        const isMember = members.some(m => m.id === userId);
+        if (!isMember) return ack?.({ error: 'not_a_member' });
 
-      const messageRow = addMessage({
-        id: crypto.randomUUID(),
-        conversationId,
-        senderId: userId,
-        text: (text || '').trim().slice(0, 4000),
-        mediaType: hasMedia ? mediaType : null,
-        mediaData: hasMedia ? mediaData : null,
-      });
-      const message = toPublicMessage(messageRow);
+        const messageRow = await addMessage({
+          id: crypto.randomUUID(),
+          conversationId,
+          senderId: userId,
+          text: (text || '').trim().slice(0, 4000),
+          mediaType: hasMedia ? mediaType : null,
+          mediaData: hasMedia ? mediaData : null,
+        });
+        const message = toPublicMessage(messageRow);
 
-      // deliver to every online socket of every member (including sender's other tabs)
-      members.forEach(member => {
-        const sockets = onlineUsers.get(member.id);
-        if (sockets && sockets.size > 0) {
-          sockets.forEach(sid => io.to(sid).emit('message:new', { conversationId, message }));
-        } else if (member.id !== userId) {
-          // offline — try a push notification instead of an in-app event
-          const sender = findUserById(userId);
-          const preview = message.mediaType === 'voice' ? '🎤 Голосове повідомлення'
-            : message.mediaType === 'image' ? '📷 Фото'
-            : message.text;
-          sendPushToUser(member.id, {
-            title: sender?.name || 'VOLT',
-            body: preview,
-            conversationId,
-          }).catch(err => console.error('push send failed:', err.message));
+        // deliver to every online socket of every member (including sender's other tabs)
+        for (const member of members) {
+          const sockets = onlineUsers.get(member.id);
+          if (sockets && sockets.size > 0) {
+            sockets.forEach(sid => io.to(sid).emit('message:new', { conversationId, message }));
+          } else if (member.id !== userId) {
+            // offline — try a push notification instead of an in-app event
+            const sender = await findUserById(userId);
+            const preview = message.mediaType === 'voice' ? '🎤 Голосове повідомлення'
+              : message.mediaType === 'image' ? '📷 Фото'
+              : message.text;
+            sendPushToUser(member.id, {
+              title: sender?.name || 'VOLT',
+              body: preview,
+              conversationId,
+            }).catch(err => console.error('push send failed:', err.message));
+          }
         }
-      });
-      ack?.({ ok: true, message });
+        ack?.({ ok: true, message });
+      } catch (err) {
+        console.error('message:send error:', err);
+        ack?.({ error: 'server_error' });
+      }
     });
 
-    socket.on('typing', ({ conversationId }) => {
-      const members = getConversationMembers(conversationId);
+    socket.on('typing', async ({ conversationId }) => {
+      const members = await getConversationMembers(conversationId);
       members.filter(m => m.id !== userId).forEach(member => {
         const sockets = onlineUsers.get(member.id);
         if (sockets) sockets.forEach(sid => io.to(sid).emit('typing', { conversationId, userId }));

@@ -1,61 +1,64 @@
-// Persistent account & chat storage — a plain JSON file on disk, loaded
-// into memory and written back after every change.
+// Persistent account & chat storage — MongoDB Atlas (free tier, hosted
+// separately from Render). This replaces the earlier JSON-file approach:
+// that file lived on Render's own disk, and Render's FREE web services
+// have no persistent disk — every restart/redeploy/sleep-wake cycle wiped
+// it clean, which is why accounts and chats kept disappearing. A real
+// hosted database survives all of that, because it isn't part of the web
+// service's filesystem at all.
 //
-// Why not a real database? better-sqlite3 (and most fast embedded DBs)
-// need to compile native C++ code when you `npm install`, which fails on
-// several free hosts depending on their exact Node/build-tool version --
-// that's the "gyp ERR!" build failure you may have hit. A JSON file needs
-// zero compilation, so `npm install` always just works. It's plenty for
-// an MVP with a handful of users; swap this file for a real Postgres/Mongo
-// client later without touching any other file — everything else only
-// calls the functions exported at the bottom.
+// Every exported function here is async (a real network call to the
+// database), unlike the old synchronous file version — every call site
+// elsewhere in the backend now needs `await`.
 
-const fs = require('fs');
-const path = require('path');
+const { MongoClient } = require('mongodb');
 const crypto = require('crypto');
 
-const DB_FILE = path.join(__dirname, '..', 'volt-data.json');
-
-function emptyData() {
-  return { users: [], conversations: [], conversationMembers: [], messages: [], pushTokens: [], sessions: [] };
+const uri = process.env.MONGODB_URI;
+if (!uri) {
+  console.error(
+    '❌ MONGODB_URI is missing. Set it in your environment variables —\n' +
+    '   see README.md for how to get a free connection string from MongoDB Atlas.'
+  );
+  process.exit(1);
 }
 
-function loadData() {
-  if (!fs.existsSync(DB_FILE)) return emptyData();
-  try {
-    const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    return { ...emptyData(), ...parsed }; // fills in any new arrays added since the file was last written
-  } catch {
-    return emptyData();
-  }
+const client = new MongoClient(uri);
+let db;
+
+async function connect() {
+  await client.connect();
+  db = client.db('volt');
+  await Promise.all([
+    db.collection('users').createIndex({ id: 1 }, { unique: true }),
+    db.collection('users').createIndex({ phone: 1 }, { unique: true }),
+    db.collection('users').createIndex({ username: 1 }, { unique: true, sparse: true }),
+    db.collection('conversations').createIndex({ id: 1 }, { unique: true }),
+    db.collection('conversations').createIndex({ memberIds: 1 }),
+    db.collection('messages').createIndex({ id: 1 }, { unique: true }),
+    db.collection('messages').createIndex({ conversation_id: 1, created_at: 1 }),
+    db.collection('pushTokens').createIndex({ user_id: 1 }),
+    db.collection('pushTokens').createIndex({ token: 1 }, { unique: true }),
+    db.collection('sessions').createIndex({ id: 1 }, { unique: true }),
+    db.collection('sessions').createIndex({ user_id: 1 }),
+  ]);
+  console.log('🗄️  Connected to MongoDB');
 }
 
-let data = loadData();
-
-function save() {
-  // Synchronous write is fine at MVP traffic levels — simplicity over
-  // throughput. Swap for a real DB before this becomes a bottleneck.
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error(`Failed to write ${DB_FILE}:`, err.message);
-    throw err;
-  }
-}
+const NO_ID = { projection: { _id: 0 } };
 
 // ---------------------------------------------------------------------
 // Users
 // ---------------------------------------------------------------------
-function findUserByPhone(phone) {
-  return data.users.find(u => u.phone === phone) || null;
+async function findUserByPhone(phone) {
+  return db.collection('users').findOne({ phone }, NO_ID);
 }
-function findUserById(id) {
-  return data.users.find(u => u.id === id) || null;
+async function findUserById(id) {
+  return db.collection('users').findOne({ id }, NO_ID);
 }
-function findUserByUsername(username) {
-  return data.users.find(u => u.username === username) || null;
+async function findUserByUsername(username) {
+  return db.collection('users').findOne({ username }, NO_ID);
 }
-function createUser({ id, phone, name, username, avatar_emoji, bio }) {
+async function createUser({ id, phone, name, username, avatar_emoji, bio }) {
   const user = {
     id,
     phone,
@@ -66,116 +69,106 @@ function createUser({ id, phone, name, username, avatar_emoji, bio }) {
     avatar_photo: null,
     created_at: Date.now(),
   };
-  data.users.push(user);
-  save();
+  await db.collection('users').insertOne(user);
+  delete user._id;
   return user;
 }
-function updateUserProfile(id, { name, username, avatar_emoji, bio, avatar_photo }) {
-  const user = findUserById(id);
-  if (!user) return null;
-  user.name = name;
-  user.username = username;
-  user.avatar_emoji = avatar_emoji;
-  user.bio = bio ?? null;
-  if (avatar_photo !== undefined) user.avatar_photo = avatar_photo; // base64 data URL, or null to clear
-  save();
-  return user;
+async function updateUserProfile(id, { name, username, avatar_emoji, bio, avatar_photo }) {
+  const set = { name, username, avatar_emoji, bio: bio ?? null };
+  if (avatar_photo !== undefined) set.avatar_photo = avatar_photo;
+  await db.collection('users').updateOne({ id }, { $set: set });
+  return findUserById(id);
 }
 
 // ---------------------------------------------------------------------
 // Conversations & messages
 // ---------------------------------------------------------------------
-function getOrCreateDirectConversation(userIdA, userIdB) {
-  const existingIds = data.conversationMembers
-    .filter(m => m.user_id === userIdA)
-    .map(m => m.conversation_id);
-  for (const convId of existingIds) {
-    const members = data.conversationMembers.filter(m => m.conversation_id === convId).map(m => m.user_id);
-    const convo = data.conversations.find(c => c.id === convId);
-    if (convo && !convo.is_group && members.includes(userIdB)) return convo;
-  }
+async function getOrCreateDirectConversation(userIdA, userIdB) {
+  const existing = await db.collection('conversations').findOne(
+    { is_group: false, memberIds: { $all: [userIdA, userIdB] } },
+    NO_ID
+  );
+  if (existing) return existing;
 
-  const id = crypto.randomUUID();
-  const convo = { id, is_group: false, name: null, created_at: Date.now() };
-  data.conversations.push(convo);
-  data.conversationMembers.push({ conversation_id: id, user_id: userIdA });
-  data.conversationMembers.push({ conversation_id: id, user_id: userIdB });
-  save();
+  const convo = {
+    id: crypto.randomUUID(),
+    is_group: false,
+    name: null,
+    memberIds: [userIdA, userIdB],
+    created_at: Date.now(),
+  };
+  await db.collection('conversations').insertOne({ ...convo });
   return convo;
 }
 
-function getConversationMembers(conversationId) {
-  const userIds = data.conversationMembers
-    .filter(m => m.conversation_id === conversationId)
-    .map(m => m.user_id);
-  return data.users.filter(u => userIds.includes(u.id));
+async function getConversationMembers(conversationId) {
+  const convo = await db.collection('conversations').findOne({ id: conversationId }, NO_ID);
+  if (!convo) return [];
+  return db.collection('users').find({ id: { $in: convo.memberIds } }, NO_ID).toArray();
 }
 
-function listConversationsForUser(userId) {
-  const convoIds = data.conversationMembers
-    .filter(m => m.user_id === userId)
-    .map(m => m.conversation_id);
+async function listConversationsForUser(userId) {
+  const convos = await db.collection('conversations').find({ memberIds: userId }, NO_ID).toArray();
 
-  const result = convoIds.map(convId => {
-    const convo = data.conversations.find(c => c.id === convId);
-    const memberIds = data.conversationMembers
-      .filter(m => m.conversation_id === convId)
-      .map(m => m.user_id);
-    const otherId = memberIds.find(id => id !== userId);
-    const other = otherId ? findUserById(otherId) : null;
-    const msgs = data.messages
-      .filter(m => m.conversation_id === convId)
-      .sort((a, b) => b.created_at - a.created_at);
-    return { ...convo, otherUser: other, lastMessage: msgs[0] || null };
-  });
+  const result = await Promise.all(convos.map(async convo => {
+    const otherId = convo.memberIds.find(id => id !== userId);
+    const other = otherId ? await findUserById(otherId) : null;
+    const lastMessageArr = await db.collection('messages')
+      .find({ conversation_id: convo.id }, NO_ID)
+      .sort({ created_at: -1 })
+      .limit(1)
+      .toArray();
+    return { ...convo, otherUser: other, lastMessage: lastMessageArr[0] || null };
+  }));
 
   return result.sort((a, b) => (b.lastMessage?.created_at || b.created_at) - (a.lastMessage?.created_at || a.created_at));
 }
 
-function addMessage({ id, conversationId, senderId, text, mediaType, mediaData }) {
+async function addMessage({ id, conversationId, senderId, text, mediaType, mediaData }) {
   const message = {
     id,
     conversation_id: conversationId,
     sender_id: senderId,
     text: text || '',
-    media_type: mediaType || null,   // null | 'image' | 'voice'
-    media_data: mediaData || null,   // base64 data URL
+    media_type: mediaType || null,
+    media_data: mediaData || null,
     created_at: Date.now(),
   };
-  data.messages.push(message);
-  save();
+  await db.collection('messages').insertOne({ ...message });
   return message;
 }
 
-function listMessages(conversationId, limit = 100) {
-  return data.messages
-    .filter(m => m.conversation_id === conversationId)
-    .sort((a, b) => a.created_at - b.created_at)
-    .slice(-limit);
+async function listMessages(conversationId, limit = 100) {
+  const rows = await db.collection('messages')
+    .find({ conversation_id: conversationId }, NO_ID)
+    .sort({ created_at: -1 })
+    .limit(limit)
+    .toArray();
+  return rows.reverse();
 }
 
 // ---------------------------------------------------------------------
 // Push notification tokens
 // ---------------------------------------------------------------------
-function savePushToken(userId, token) {
-  const exists = data.pushTokens.some(t => t.user_id === userId && t.token === token);
-  if (!exists) {
-    data.pushTokens.push({ user_id: userId, token, created_at: Date.now() });
-    save();
-  }
+async function savePushToken(userId, token) {
+  await db.collection('pushTokens').updateOne(
+    { token },
+    { $set: { user_id: userId, token, created_at: Date.now() } },
+    { upsert: true }
+  );
 }
-function getPushTokensForUser(userId) {
-  return data.pushTokens.filter(t => t.user_id === userId).map(t => t.token);
+async function getPushTokensForUser(userId) {
+  const rows = await db.collection('pushTokens').find({ user_id: userId }, NO_ID).toArray();
+  return rows.map(r => r.token);
 }
-function removePushToken(token) {
-  data.pushTokens = data.pushTokens.filter(t => t.token !== token);
-  save();
+async function removePushToken(token) {
+  await db.collection('pushTokens').deleteOne({ token });
 }
 
 // ---------------------------------------------------------------------
-// Sessions (real logged-in devices, shown in Settings -> Devices)
+// Sessions (real logged-in devices — Settings -> Devices)
 // ---------------------------------------------------------------------
-function createSession({ userId, userAgent, ip }) {
+async function createSession({ userId, userAgent, ip }) {
   const session = {
     id: crypto.randomUUID(),
     user_id: userId,
@@ -184,25 +177,22 @@ function createSession({ userId, userAgent, ip }) {
     created_at: Date.now(),
     last_seen_at: Date.now(),
   };
-  data.sessions.push(session);
-  save();
+  await db.collection('sessions').insertOne({ ...session });
   return session;
 }
-function touchSession(sessionId) {
-  const s = data.sessions.find(s => s.id === sessionId);
-  if (s) { s.last_seen_at = Date.now(); save(); }
+async function touchSession(sessionId) {
+  await db.collection('sessions').updateOne({ id: sessionId }, { $set: { last_seen_at: Date.now() } });
 }
-function listSessionsForUser(userId) {
-  return data.sessions
-    .filter(s => s.user_id === userId)
-    .sort((a, b) => b.last_seen_at - a.last_seen_at);
+async function listSessionsForUser(userId) {
+  const rows = await db.collection('sessions').find({ user_id: userId }, NO_ID).toArray();
+  return rows.sort((a, b) => b.last_seen_at - a.last_seen_at);
 }
-function deleteSession(sessionId) {
-  data.sessions = data.sessions.filter(s => s.id !== sessionId);
-  save();
+async function deleteSession(sessionId) {
+  await db.collection('sessions').deleteOne({ id: sessionId });
 }
 
 module.exports = {
+  connect,
   findUserByPhone, findUserById, createUser, updateUserProfile,
   findUserByUsername,
   getOrCreateDirectConversation,
