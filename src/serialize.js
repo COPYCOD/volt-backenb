@@ -27,6 +27,7 @@ function toPublicMessage(m) {
     text: m.text,
     mediaType: m.media_type || null,   // null | 'image' | 'voice'
     mediaData: m.media_data || null,   // base64 data URL, when mediaType is set
+    replyToId: m.reply_to_id || null,
     createdAt: m.created_at,
   };
 }

@@ -1,7 +1,7 @@
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { addMessage, getConversationMembers, findUserById, touchSession } = require('./db');
+const { addMessage, deleteMessage, getConversationMembers, findUserById, touchSession } = require('./db');
 const { toPublicMessage } = require('./serialize');
 const { sendPushToUser } = require('./push');
 
@@ -36,7 +36,7 @@ function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
     broadcastPresence(io, userId, true);
 
     // ---- chat messages (text, and optionally a photo or voice note) ----
-    socket.on('message:send', async ({ conversationId, text, mediaType, mediaData }, ack) => {
+    socket.on('message:send', async ({ conversationId, text, mediaType, mediaData, replyToId }, ack) => {
       try {
         const hasMedia = mediaType && mediaData;
         if (!conversationId || (!hasMedia && !text?.trim())) return ack?.({ error: 'invalid_message' });
@@ -51,6 +51,7 @@ function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
           text: (text || '').trim().slice(0, 4000),
           mediaType: hasMedia ? mediaType : null,
           mediaData: hasMedia ? mediaData : null,
+          replyToId: replyToId || null,
         });
         const message = toPublicMessage(messageRow);
 
@@ -85,6 +86,23 @@ function attachRealtime(httpServer, { corsOrigin, jwtSecret }) {
         const sockets = onlineUsers.get(member.id);
         if (sockets) sockets.forEach(sid => io.to(sid).emit('typing', { conversationId, userId }));
       });
+    });
+
+    // ---- delete a message (sender only) ----
+    socket.on('message:delete', async ({ messageId }, ack) => {
+      try {
+        const conversationId = await deleteMessage(messageId, userId);
+        if (!conversationId) return ack?.({ error: 'not_found_or_not_owner' });
+        const members = await getConversationMembers(conversationId);
+        members.forEach(member => {
+          const sockets = onlineUsers.get(member.id);
+          if (sockets) sockets.forEach(sid => io.to(sid).emit('message:deleted', { conversationId, messageId }));
+        });
+        ack?.({ ok: true });
+      } catch (err) {
+        console.error('message:delete error:', err);
+        ack?.({ error: 'server_error' });
+      }
     });
 
     // ---- WebRTC call signaling (server just relays SDP/ICE between two users) ----

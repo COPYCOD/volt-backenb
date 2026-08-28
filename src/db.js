@@ -124,7 +124,7 @@ async function listConversationsForUser(userId) {
   return result.sort((a, b) => (b.lastMessage?.created_at || b.created_at) - (a.lastMessage?.created_at || a.created_at));
 }
 
-async function addMessage({ id, conversationId, senderId, text, mediaType, mediaData }) {
+async function addMessage({ id, conversationId, senderId, text, mediaType, mediaData, replyToId }) {
   const message = {
     id,
     conversation_id: conversationId,
@@ -132,10 +132,24 @@ async function addMessage({ id, conversationId, senderId, text, mediaType, media
     text: text || '',
     media_type: mediaType || null,
     media_data: mediaData || null,
+    reply_to_id: replyToId || null,
     created_at: Date.now(),
   };
   await db.collection('messages').insertOne({ ...message });
   return message;
+}
+
+async function findMessageById(id) {
+  return db.collection('messages').findOne({ id }, NO_ID);
+}
+
+// Only the sender may delete their own message. Returns the deleted
+// message's conversation_id on success, or null if not found/not owner.
+async function deleteMessage(id, requesterId) {
+  const msg = await findMessageById(id);
+  if (!msg || msg.sender_id !== requesterId) return null;
+  await db.collection('messages').deleteOne({ id });
+  return msg.conversation_id;
 }
 
 async function listMessages(conversationId, limit = 100) {
@@ -199,6 +213,8 @@ module.exports = {
   listConversationsForUser,
   addMessage,
   listMessages,
+  findMessageById,
+  deleteMessage,
   getConversationMembers,
   savePushToken,
   getPushTokensForUser,
